@@ -71,7 +71,9 @@ func (c *Client) Do(ctx context.Context, method, path string, body, out any) err
 		return err
 	}
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+c.apiKey)
+	// Ultraner API keys authenticate via X-API-Key (Authorization: Bearer is
+	// reserved for user JWTs and would be rejected for a uk_ key).
+	req.Header.Set("X-API-Key", c.apiKey)
 
 	res, err := c.http.Do(req)
 	if err != nil {
@@ -192,5 +194,46 @@ func (c *Client) CreateEscrow(ctx context.Context, in Escrow) (map[string]any, e
 func (c *Client) ReleaseEscrow(ctx context.Context, escrowCode string) (map[string]any, error) {
 	var out map[string]any
 	err := c.Do(ctx, http.MethodPost, "/v1/escrow/"+url.PathEscape(escrowCode)+"/release", nil, &out)
+	return out, err
+}
+
+// CheckoutSessionInput creates a one-time, expiring checkout token.
+type CheckoutSessionInput struct {
+	Amount                int64  `json:"amount"`
+	Currency              string `json:"currency,omitempty"`
+	Title                 string `json:"title,omitempty"`
+	Description           string `json:"description,omitempty"`
+	ExpiresInMinutes      int    `json:"expires_in_minutes,omitempty"`
+	IssueReceipt          bool   `json:"issue_receipt,omitempty"`
+	IsRecurring           bool   `json:"is_recurring,omitempty"`
+	RecurringInterval     string `json:"recurring_interval,omitempty"`
+	RecurringIntervalDays int    `json:"recurring_interval_days,omitempty"`
+}
+
+// CheckoutSession is a minted checkout token: open its URL or embed the token.
+type CheckoutSession struct {
+	ID        string `json:"id"`
+	Token     string `json:"token"`
+	URL       string `json:"url"`
+	EmbedURL  string `json:"embed_url"`
+	Amount    int64  `json:"amount"`
+	Currency  string `json:"currency"`
+	Mode      string `json:"mode"`
+	ExpiresAt string `json:"expires_at"`
+	Status    string `json:"status"`
+}
+
+// CreateCheckoutSession mints a one-time checkout token, the Stripe
+// checkout.sessions.create parity, without touching the dashboard.
+func (c *Client) CreateCheckoutSession(ctx context.Context, in CheckoutSessionInput) (*CheckoutSession, error) {
+	var out CheckoutSession
+	err := c.Do(ctx, http.MethodPost, "/v0/checkout/sessions", in, &out)
+	return &out, err
+}
+
+// RetrieveCheckoutSession looks up a session by its token.
+func (c *Client) RetrieveCheckoutSession(ctx context.Context, token string) (map[string]any, error) {
+	var out map[string]any
+	err := c.Do(ctx, http.MethodGet, "/v0/pay/resolve/"+url.PathEscape(token), nil, &out)
 	return out, err
 }
