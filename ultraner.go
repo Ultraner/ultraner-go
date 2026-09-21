@@ -7,11 +7,14 @@ package ultraner
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
+	"regexp"
 	"strconv"
 	"time"
 )
@@ -29,9 +32,10 @@ func (e *Error) Error() string { return fmt.Sprintf("ultraner: %s (%s, %d)", e.M
 
 // Client is an Ultraner API client.
 type Client struct {
-	apiKey  string
-	baseURL string
-	http    *http.Client
+	apiKey       string
+	signatureKey string
+	baseURL      string
+	http         *http.Client
 }
 
 // Option configures the Client.
@@ -42,6 +46,40 @@ func WithBaseURL(u string) Option { return func(c *Client) { c.baseURL = u } }
 
 // WithHTTPClient sets a custom *http.Client.
 func WithHTTPClient(h *http.Client) Option { return func(c *Client) { c.http = h } }
+
+// WithSignatureKey sets the signature key (usig_live_ / usig_test_) required
+// to pay money out. The API will not accept a disbursement authenticated by
+// an API key alone: a key identifies a business, not a person, and money
+// leaving should have somebody's name against it. Create one in the Developer
+// console under API Keys > Signatures.
+func WithSignatureKey(k string) Option { return func(c *Client) { c.signatureKey = k } }
+
+// versionSeg matches the leading /vN segment of a path.
+var versionSeg = regexp.MustCompile(`^/(v\d+)(/|$)`)
+
+// route rewrites a live path to its sandbox equivalent for a test key.
+//
+// The API selects sandbox by URL, not by key alone: a uk_test_ key must go
+// to /vN-sandbox/... and is rejected on /vN/... ("A test API key cannot be
+// used on a live URL"). This SDK hardcoded the live paths, so a test key
+// could not be used at all. Derived from the key so nobody has to know this.
+func (c *Client) route(path string) string {
+	if len(c.apiKey) < 8 || c.apiKey[:8] != "uk_test_" {
+		return path
+	}
+	return versionSeg.ReplaceAllString(path, "/$1-sandbox$2")
+}
+
+// idempotencyKey returns a fresh key, so a single call is always safe to make.
+func idempotencyKey() string {
+	b := make([]byte, 16)
+	if _, err := rand.Read(b); err != nil {
+		// A time-based fallback is still unique enough to stop a retry being
+		// read as a second payment, which is the only job this has.
+		return fmt.Sprintf("%d", time.Now().UnixNano())
+	}
+	return hex.EncodeToString(b)
+}
 
 // New creates a Client with the given API key.
 func New(apiKey string, opts ...Option) *Client {
@@ -58,6 +96,17 @@ func New(apiKey string, opts ...Option) *Client {
 
 // Do performs a request against the API. out may be nil.
 func (c *Client) Do(ctx context.Context, method, path string, body, out any) error {
+	return c.do(ctx, method, path, body, out, false)
+}
+
+// do adds the headers the API requires. signed marks a call that moves money
+// out, which needs a signature key; it is checked before the request is sent
+// so the failure names the missing configuration rather than arriving as a
+// 403 from the gateway.
+func (c *Client) do(ctx context.Context, method, path string, body, out any, signed bool) error {
+	if signed && c.signatureKey == "" {
+		return fmt.Errorf("ultraner: paying money out needs a signature key; pass WithSignatureKey(...) from Developer console > API Keys > Signatures")
+	}
 	var reader io.Reader
 	if body != nil {
 		b, err := json.Marshal(body)
@@ -66,7 +115,7 @@ func (c *Client) Do(ctx context.Context, method, path string, body, out any) err
 		}
 		reader = bytes.NewReader(b)
 	}
-	req, err := http.NewRequestWithContext(ctx, method, c.baseURL+path, reader)
+	req, err := http.NewRequestWithContext(ctx, method, c.baseURL+c.route(path), reader)
 	if err != nil {
 		return err
 	}
@@ -74,6 +123,14 @@ func (c *Client) Do(ctx context.Context, method, path string, body, out any) err
 	// Ultraner API keys authenticate via X-API-Key (Authorization: Bearer is
 	// reserved for user JWTs and would be rejected for a uk_ key).
 	req.Header.Set("X-API-Key", c.apiKey)
+	// Required by the API on every API-key-authenticated call that moves
+	// money, so a retry after a timeout cannot send it twice.
+	if method != http.MethodGet {
+		req.Header.Set("Idempotency-Key", idempotencyKey())
+	}
+	if signed {
+		req.Header.Set("X-Signature-Key", c.signatureKey)
+	}
 
 	res, err := c.http.Do(req)
 	if err != nil {
@@ -112,12 +169,14 @@ type PaymentResponse struct {
 }
 
 // MobileMoneyCharge charges a mobile-money wallet.
+// MobileMoneyCharge is a collection request. A charge uses Provider, where a
+// payout uses Network.
 type MobileMoneyCharge struct {
-	Amount        int64  `json:"amount"`
-	Currency      string `json:"currency"`
-	Provider      string `json:"provider"`
-	AccountNumber string `json:"accountNumber"`
-	ExternalID    string `json:"externalId,omitempty"`
+	Provider          string `json:"provider"`
+	AccountNumber     string `json:"account_number"`
+	Amount            int64  `json:"amount"`
+	Currency          string `json:"currency,omitempty"`
+	MerchantReference string `json:"merchant_reference,omitempty"`
 }
 
 // CreateMobileMoney charges a mobile-money wallet.
@@ -135,18 +194,22 @@ func (c *Client) PaymentStatus(ctx context.Context, reference string) (*PaymentR
 }
 
 // Disbursement sends money to a mobile wallet or bank.
+// Disbursement is a payout request. Field names match the API's Zod schema:
+// a payout selects the rail with Network, not Provider, and the JSON keys are
+// snake_case.
 type Disbursement struct {
+	Network       string `json:"network"`
+	AccountNumber string `json:"account_number"`
 	Amount        int64  `json:"amount"`
-	Currency      string `json:"currency"`
-	Provider      string `json:"provider"`
-	AccountNumber string `json:"accountNumber"`
-	ExternalID    string `json:"externalId,omitempty"`
+	Currency      string `json:"currency,omitempty"`
+	RecipientName string `json:"recipient_name,omitempty"`
+	Remarks       string `json:"remarks,omitempty"`
 }
 
-// CreateDisbursement sends a payout.
+// CreateDisbursement sends a payout. Requires WithSignatureKey on the client.
 func (c *Client) CreateDisbursement(ctx context.Context, in Disbursement) (*PaymentResponse, error) {
 	var out PaymentResponse
-	err := c.Do(ctx, http.MethodPost, "/v1/disbursements", in, &out)
+	err := c.do(ctx, http.MethodPost, "/v1/disbursements", in, &out, true)
 	return &out, err
 }
 
@@ -166,7 +229,7 @@ func (c *Client) Transactions(ctx context.Context, page, limit int) (map[string]
 	if limit > 0 {
 		q.Set("limit", strconv.Itoa(limit))
 	}
-	path := "/v1/transactions"
+	path := "/v1/wallet/transactions"
 	if e := q.Encode(); e != "" {
 		path += "?" + e
 	}
